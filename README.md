@@ -1,13 +1,13 @@
 # Implicit-Feedback Recommender with Cold-Start Routing
 
 A ranking system built the way a real catalogue forces you to build one: nobody rates
-anything, the popularity distribution is a power law, a sixth of the catalogue launched
-too recently to have any interaction history, and the list that goes on the page is not
-the raw model output.
+anything, the popularity distribution is a power law, a sixth of the catalogue launched too
+recently to have any interaction history, and the list that goes on the page is not the raw
+model output.
 
-Four recommenders are implemented from scratch on top of numpy and scipy, evaluated
-against a **time-based** split, and then passed through the business layer that decides
-what a customer actually sees.
+Five recommenders are implemented from scratch on top of numpy and scipy, evaluated against
+a **time-based** split, and then passed through the business layer that decides what a
+customer actually sees.
 
 ```
 events (user, item, type, day)
@@ -17,12 +17,12 @@ temporal split  ->  train window        holdout window (ground truth)
         |
         v
 models: popularity | item-item CF | ALS (implicit) | content-based | hybrid
-        |
+        |                                    (routing + a reserved discovery slot)
         v
-ranking metrics: Recall@K, NDCG@K, MAP@K  +  coverage, novelty, Gini
+ranking metrics: Recall@K, NDCG@K, MAP@K  +  coverage, novelty, Gini, cold-item share
         |            (broken out by user segment and item age)
         v
-re-ranking: drop seen/unavailable, cap per category, MMR diversity, margin boost
+re-ranking: drop seen/unavailable, cap per category, MMR diversity, margin nudge
 ```
 
 ## Why this is not another MovieLens notebook
@@ -31,26 +31,37 @@ re-ranking: drop seen/unavailable, cap per category, MMR diversity, margin boost
 strong evidence, and a *missing* interaction is not evidence of dislike - it usually means
 the item was never shown. The ALS implementation follows Hu, Koren & Volinsky: every
 user-item cell is a training example, with a *confidence* weight derived from the event
-type, and unobserved cells are treated as low-confidence zeros rather than dropped. Squeezing
-implicit events into a rating matrix and running plain SVD is the single most common way this
-problem is done wrong.
+type, and unobserved cells are treated as low-confidence zeros rather than dropped.
+Squeezing implicit events into a rating matrix and running plain SVD is the single most
+common way this problem is done wrong.
 
-**A random split leaks the future.** Splitting interactions at random lets a model learn from
-next month's behaviour to predict last month's, and inflates every metric. The split here is a
-timestamp cut: the model sees days `0..T`, and is scored on what happened after `T` - including
-on users and items that barely existed at `T`.
+**A random split leaks the future.** Splitting interactions at random lets a model learn
+from next month's behaviour to predict last month's, and inflates every metric. The split
+here is a timestamp cut: the model sees days `0..T` and is scored on what happened after `T`
+- including on users and items that barely existed at `T`. Confidence also decays with an
+exponential half-life, because a click from eight months ago is not worth the same as one
+from last week.
 
 **Cold start is not an edge case, it is a permanent segment.** Matrix factorization has no
-factors for an item nobody has touched, so ALS structurally cannot recommend new stock; its
-embedding stays near the initialization and the item never surfaces. The evaluation therefore
-reports **cold-item exposure** alongside accuracy, and the hybrid routes cold users and cold
-items to a content model that only needs attributes known at launch.
+factors for an item nobody has touched, so ALS structurally cannot recommend new stock: its
+embedding never receives a gradient and the item never surfaces. The test suite asserts
+this rather than describing it. Two mechanisms address it, and the second is the one that
+actually works:
 
-**Accuracy alone ships a bad page.** A model optimised for Recall@10 will happily return ten
-variants of the same product, items that are out of stock, and things the customer bought
-yesterday. The re-ranking layer applies the constraints a merchandiser would insist on, and the
-report shows what each constraint costs in recall - because that trade is a business decision,
-not a modelling one.
+- *routing* - users with no history get recent bestsellers, users with one or two
+  interactions get a content-led list, and only users with real history get the
+  collaborative models. A model fitted on one interaction is fitting noise.
+- *an exposure quota* - one slot in every ten is reserved for the best content-matched item
+  with no interaction history. A score boost cannot fix cold start, because new items lose
+  on every collaborative signal by construction; without a reserved slot they never appear,
+  never accumulate feedback, and stay cold forever. The cost is explicit - one slot - rather
+  than buried in a weight.
+
+**Accuracy alone ships a bad page.** A model optimised for Recall@10 will happily return
+ten variants of the same product, items that are out of stock, and things the customer
+bought yesterday. The re-ranking layer applies the constraints a merchandiser would insist
+on and reports what each one removed, because that trade is a business decision rather than
+a modelling one.
 
 ## What the harness reports
 
@@ -59,9 +70,9 @@ not a modelling one.
 | Did we put something relevant in the top K? | Recall@K, Hit-rate@K |
 | Was it near the top? | NDCG@K, MAP@K, MRR |
 | How much of the catalogue can we even sell? | Catalogue coverage |
-| Are we just re-selling the bestsellers? | Novelty, Gini of recommended popularity |
-| Can new stock get exposure? | Cold-item share of recommendations |
-| Does it work for people with no history? | Metrics split by user activity segment |
+| Are we just re-selling the bestsellers? | Novelty, Gini of recommendation exposure |
+| Can new stock get exposure? | Cold-item share of recommended slots |
+| Does it work for people with no history? | Every metric split by user segment |
 
 Every model is scored on identical users, identical ground truth and identical K, and the
 popularity baseline is always in the table. A collaborative model that cannot beat "show
@@ -78,7 +89,7 @@ recsys/
   metrics.py    ranking and catalogue metrics, each hand-verifiable
   evaluate.py   evaluation harness, segment and cold-start breakdowns
   rerank.py     business rules: availability, per-category caps, MMR diversity, margin
-  cli.py        data / evaluate / segments / coldstart / recommend
+  cli.py        data / evaluate / segments / coldstart / recommend / similar
 tests/          leakage, model behaviour, metric arithmetic, re-ranking guarantees
 ```
 
@@ -89,9 +100,10 @@ pip install -r requirements.txt
 
 python -m recsys.cli data                # generate the log and describe its structure
 python -m recsys.cli evaluate            # all models against the temporal split
-python -m recsys.cli segments            # accuracy by user activity and tenure
+python -m recsys.cli segments            # accuracy by user history and tenure
 python -m recsys.cli coldstart           # who can actually surface new stock
-python -m recsys.cli recommend --user-id U0007   # a real list, before and after re-ranking
+python -m recsys.cli recommend --user-id U0007   # one list, before and after the rules
+python -m recsys.cli similar --item-id I0001     # item neighbourhoods
 
 pytest -q
 ```
@@ -101,12 +113,13 @@ pytest -q
 - The event log is synthetic. It contains popularity bias, repeat purchases, taste drift and
   staggered launches on purpose, but no real catalogue is this well behaved.
 - Offline ranking metrics are a proxy. They can only reward re-discovering what the logging
-  policy already showed the user; the true test is an online experiment, and no offline number
-  settles it.
-- ALS here is exact-solve per user, which is the clear implementation rather than the fastest
-  one. At tens of millions of interactions you would want conjugate-gradient solves and
-  approximate nearest neighbours at serving time.
-- Confidence weights per event type are a business assumption, not a fitted parameter. They are
-  in one place so they can be argued about.
+  policy already showed the user; the true test is an online experiment, and no offline
+  number settles it. The discovery quota in particular *costs* offline accuracy and is
+  justified by what it buys later - which offline evaluation cannot see.
+- ALS here solves exactly per user, which is the clear implementation rather than the
+  fastest one. At tens of millions of interactions you would want conjugate-gradient solves
+  and approximate nearest neighbours at serving time.
+- Confidence weights per event type are a business assumption, not a fitted parameter. They
+  live in one place so they can be argued about.
 
 MIT licensed.
